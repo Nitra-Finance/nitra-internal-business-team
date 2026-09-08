@@ -47,3 +47,6 @@ SOQL: aliases are only allowed on aggregates; `LAST_N_DAYS:400` works on datetim
 ## Delivery
 
 Send the xlsx and pptx with `SendUserFile`. In the reply lead with the three or four things worth acting on this week (recovery, competitive threat, capped utilization, ownership change), then the judgment calls made (Gong via Salesforce, excluded monthly columns, modelled cashback). Cite the Sigma workbook URL and Nitra Brain pages used.
+
+### Example delivery
+https://docs.google.com/presentation/d/1Fom97y87WYDDWSglVCTzEuJhPexFrNlVM8OY2iZR7_o/edit?slide=id.p25#slide=id.p25
