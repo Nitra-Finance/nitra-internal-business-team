@@ -1,1 +1,49 @@
+# Practice consultation book
 
+Produce the CS "practice consultant" package for Nitra's top customers: one workbook row and one battle-card slide per account, each carrying spend, modelled cashback, the latest Gong conversation, anything notable online, a specific play for now, and a near-term 4P hypothesis (pillar, pain, product, POC) for pre-discovery.
+
+Default scope is the top 100 by cumulative card spend. Confirm N, the cashback rate (default 2.2%), and whether the user wants xlsx only or xlsx plus deck before pulling data.
+
+## Sources and how to reach them
+
+| Need | Source | Notes |
+|---|---|---|
+| Spend, limit, utilization, balance, status, days active | Sigma workbook **CS Spend Metrics Dashboard** (`c39d0ed3-40fa-4b3a-8929-3c8b34a2d2c5`, element `_WiZ7CB_ue`) | `describe` and `query` need one-time approval in the session; `search` does not. Use `Total Spend` (cumulative since approval) and `Avg Monthly Spend Full Month`. Do **not** publish the Current/Last/Two/Three Months Ago columns — they do not reconcile with the average; a real monthly series needs the card transaction table. |
+| Practice name, specialty, city, state, physicians, website, owner | Salesforce `Account` joined on `Organization_ID__c` = Sigma `Organization Id` | `Current_Card_Spend__c` is an enrichment estimate of spend on *other* cards, never Nitra actuals. `Opportunity.Amount` is the credit limit. |
+| Contact | Salesforce `Contact` where `Account.Organization_ID__c IN (...)` and `Email != null` | Rank by title (CEO/CFO/COO/owner/administrator > director/controller > billing > clinician), penalise `example@example.com`, `@na.com`, `1111111111`. Expect ~4% with no usable contact. |
+| Conversations | Salesforce `Gong__Gong_Call__c` (there is no Gong MCP) | Fields: `Gong__Call_Start__c`, `Gong__Title__c`, `Gong__Scope__c`, `Gong__Primary_User__r.Name`, `Gong__Call_Key_Points__c`, `Gong__Call_Highlights_Next_Steps__c`. Filter `Gong__Primary_Account__r.Organization_ID__c IN (...)`. Prefer External scope in the last 400 days; fall back to any-age for accounts with none. Results overflow to a file — parse with Python, never read raw. |
+| Web signals | 5 parallel `general-purpose` subagents, 20 accounts each, WebSearch/WebFetch only | Ask for dated, sourced signals (hires, locations, acquisitions, PE, awards, closures) from the last ~18 months; require a city/state/domain match; return JSON `{org_id, signals:[{what,date,url}], note}`; `signals: []` when nothing credible. Expect ~35–40% hit rate. |
+| Product facts and the 4P framework | Nitra Brain (`search_nitra_knowledge`, `list_products`) and the Google Doc *Customer Success: Pre-Discovery for Nitra Platform* (`1Z6qmtV_N4QsnjKIRP_GrdClM3dwTjHdxTDB3MSMHeeU`) | Card 2.2% medical/pharma, 2% business, 1% other, 52-day float, rewards pooling; NitraMart 5%; BillPay free; FlexPay 30d 1.49% / 60d 2.99%; Capital up to $2M at prime + 1%. |
+
+SOQL: aliases are only allowed on aggregates; `LAST_N_DAYS:400` works on datetime fields; batch org IDs in groups of 50.
+
+## Build order
+
+1. **Sigma pull.** Query the workbook element, `ORDER BY "TO6rTinD4P" DESC LIMIT N`. Sanity-check: sum of Total Spend vs. the whole book (top 100 ≈ 83% of ~$1.08B).
+2. **Salesforce joins.** Accounts (all IDs should match), then contacts, then Gong. Save each raw result and write a `spend.csv`, `contacts_best.json`, `gong_digest.json`.
+3. **Web research** via subagents, merged into `web_all.json`.
+4. **Approaches.** Write two things per account in a dict keyed by org_id:
+   - *Play now* — a short label plus 2–3 sentences grounded in the latest Gong next-steps, the web signal, and the spend shape (utilization ≥ 75% → limit conversation first; no external call in 400 days → re-engage; open irritant → fix before pitching).
+   - *Near-term 4P* — primary and secondary product, pain to validate, POC, two qualifying questions, hand-off plan. Pillar/POC table:
+     - Reception → Revenue · # patients booked → Will Huang, Alex Isaacs (live on ModMed, Nextech — do not disqualify others)
+     - Grow → Revenue · # times booked → Mallory Doughty, John Kim (cash-pay: medspa, derm, plastics)
+     - Claims → Revenue · $ per booking → John Kim, Robert Leung (live on ModMed, Nextech, eCW, Athena, Practice Fusion; default for retina)
+     - Capital → Revenue · # locations → Fred Tsai, Rich Kim, Robert Leung (documented new site/roll-up, or utilization > 100%)
+     - Mart → Cost · procurement → Willy Cho, Robert Leung (usually secondary on retina)
+     - FlexPay → Cost · financial liabilities → Willy Cho, Lilian Hsiao (off-card drug invoices, reimbursement gap, carrying interest)
+     - Fintech → Cost · expense management → Robert Leung, Susan Liu, Shawn Lee (QuickBooks pain, controls, multi-entity)
+   Accounts in recovery (delinquent, bankrupt) get no 4P — mark "collections, not consulting".
+5. **Workbook** (openpyxl, Arial, formulas not values, `recalc.py` must report 0 errors). Tabs: `Assumptions & Method` (rate inputs in blue, source table, caveats, 4P table), `Top 100 by Spend` (one row per account; cashback columns reference the rate cell; totals row; autofilter; freeze panes), `Outreach by Product` (grouped by primary product, subtotals), `Watchlist`, `Cashback Summary` (SUMIF rollups by owner, specialty, product — must reconcile to 100 accounts and the grand total).
+6. **Deck** (pptxgenjs, `LAYOUT_WIDE`, Cambria headers / Calibri body, no accent stripes). Takeaways: title, book in numbers, spend by specialty and owner (native bar charts), concentration, Gong themes, online growth vs risk, act-this-week, 4P mapping charts, 4P table, outreach by product (revenue slide + capital/cost slide), next 30 days, how to read a card, divider. Then one battle card per account on a fixed three-column grid: spend snapshot + cashback + contact | latest Gong + online | play now + near-term 4P. Speaker notes carry the full hand-off plan. Run `validate.py`, render a sample of slides, and look at them.
+
+## Text rules that prevent rework
+
+- Never cut text on a character count. Trim Gong key points to whole numbered items, next steps to whole bullets, everything else to a sentence boundary. Audit every card field for terminal punctuation before shipping.
+- Do not truncate practice names with an ellipsis; let them wrap.
+- State the cashback figure as modelled, an upper bound on the card tier; say to pull actual awarded points before quoting to a customer.
+- Compare accounts on run-rate, not Total Spend (tenure varies from ~45 to ~950 days).
+- Flag, do not fix silently: miscoded Salesforce records (wrong state, non-clinical website), name-collision risk in web results, placeholder contacts.
+
+## Delivery
+
+Send the xlsx and pptx with `SendUserFile`. In the reply lead with the three or four things worth acting on this week (recovery, competitive threat, capped utilization, ownership change), then the judgment calls made (Gong via Salesforce, excluded monthly columns, modelled cashback). Cite the Sigma workbook URL and Nitra Brain pages used.
