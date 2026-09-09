@@ -1,1 +1,303 @@
+---
+name: account-card
+description: Re-engage a Nitra customer account that has gone quiet. Builds the platform reality from Sigma and the relationship history from Salesforce/Gong/Gmail/Slack, then finds the gap between them that becomes the hook to get them back on a call. Use when Lisa names an account that has stopped replying, asks why spend dropped, what we promised them, who to call, what the hook is, or wants call prep, a re-engagement email, or a credit-limit request. Not the right skill for an account that is already engaged and talking to us.
+---
 
+# Account card
+
+Three layers, in this order. The value is almost never in any one layer — it is in the
+gap between what the platform shows and what the relationship record says.
+
+1. **Platform reality** — what the account actually did. Sigma.
+2. **Relationship history** — what was said and promised. Salesforce Tasks/Events (Gong
+   briefs and logged emails), Gmail, Slack.
+3. **The gap** — commitments never delivered, failures the customer felt that nobody
+   mentioned. This is where the hook lives.
+
+Exact workbook IDs, element IDs, column IDs, ready-made queries and the decline taxonomy
+are in `references/data-sources.md`. Email voice, the Slack credit-limit format and the
+call-prep shape are in `references/formats.md`. Read the relevant reference before
+querying or drafting — do not guess column IDs or reinvent the house formats.
+
+## 0. Resolve the account before anything else
+
+Get all three identifiers and confirm they agree:
+
+- **Nitra org ID** (integer, e.g. 361) — the key for everything in Sigma
+- **Salesforce Account Id** (`001Vr...`) — the key for all activity history
+- The exact legal name
+
+Then run two checks that have both caused real errors:
+
+**Name collisions.** Several accounts in the book have near-identical names and Nitra
+staff routinely confuse them. Check `references/data-sources.md` § Known traps before
+attributing anything. A hook pointed at the wrong practice fails badly.
+
+**Multi-EIN families.** Query `Account.ParentId` — never infer a family from names or
+addresses:
+
+```sql
+SELECT Id, Name, ParentId, Parent.Name FROM Account WHERE Id IN ('...','...')
+```
+
+If the account is part of a family, roll dollars up by sum and recompute utilization from
+the rolled-up numbers. **Portal users cannot be summed** — the same admins hold seats on
+every entity. Dedupe by name.
+
+## 0.5 Triage — is this account actually cold, and cold in what way?
+
+Do this before the sweep. Silence is not one condition and the four kinds need opposite
+responses. Getting this wrong is the most expensive mistake available: apologising to an
+engaged customer is a downgrade, and manufacturing a grievance for a contented one costs
+them a meeting and costs you credibility.
+
+**Not actually cold.** They reply — just not to what we sent. Measure their real response
+times before concluding anything. One contact who looked unresponsive had replied in 53
+minutes, and the thing he ignored was an invitation that failed his own stated filter
+("shoot that over via email if there is anything high priority"). *Play:* re-send the same
+ask, framed to the filter they told you about. Do not apologise; nothing is wrong.
+
+**Cold and content.** Spending normally, paying on time, simply does not need much from us.
+*Play:* answer any question of theirs still open, then leave them alone. **No reset call.**
+Note it and move the hour to an account that needs it.
+
+**Cold because our end broke.** The contact left, the mailbox bounces, the CSM changed three
+times, the handoffs were dropped. *Play:* fix the address book first — you cannot re-engage
+a retired employee — then re-introduce by naming the turnover plainly. That is far more
+credible than a fifth introduction email.
+
+**Cold and collapsing.** Spend falling, commitments dropped, genuinely ghosting. *Play:* the
+full sweep below. This is the case the rest of this skill is written for.
+
+If several accounts land in the same bucket the same week, **stagger the outreach**. A batch
+of "sorry we dropped the ball" emails from one person inside a few days reads as a campaign,
+not as sincerity.
+
+## 1. Platform reality
+
+Pull, at minimum: credit limit, current outstanding, point-in-time utilization, the
+13-month monthly spend series, declines grouped by reason, feature adoption, and the
+portal user list with login counts and last-login dates.
+
+Two rules that override anything the data appears to say:
+
+**Utilization is `outstanding / credit limit`, computed now.** Sigma's
+`org_monthly_summary` has a `Utilization` field — it is a lifetime average that barely
+moves and it is wrong for every conversation you will have. It once read 54% for an
+account owing $342, and it masked two accounts sitting above 85%. Never use it as a
+headline.
+
+**Declines have owners.** `spending_control_exceeded` is the customer's own card limit.
+`account_credit_limit_exceeded` is Nitra's underwritten ceiling. Only the second is a
+credit conversation; the first is a fifteen-minute settings review. Confusing them once
+produced the headline "you are actively throttling your fastest-growing customer" about
+$1.07M of spend the customer had blocked themselves. Full taxonomy in the reference.
+
+When you find a decline, **pull the surrounding 48 hours**. The decline itself is a fact;
+what the customer did next is the story. On one account the sequence was: large charge
+clears, $55,950 declines twice 22 seconds apart, customer wires $500,000 overnight, then
+runs a charge 3.5× the declined one. That sequence — not the decline — was the hook.
+
+Check the transaction history's full date range before saying "ever" or "the only time".
+
+## 2. Relationship history
+
+**Salesforce Tasks are the richest source in the company and are underused.**
+
+```sql
+SELECT Id, Subject, ActivityDate, Description, CallDurationInSeconds, Status,
+       CreatedDate, WhoId, OwnerId
+FROM Task WHERE AccountId = '<id>' ORDER BY ActivityDate DESC LIMIT 50
+```
+
+Three kinds of Task matter:
+
+- **`[Gong]` / `[Gong Inbound]` / `[Gong Outbound]`** — the Description holds a call
+  brief, numbered Key Discussion Points, and a **Next steps** list. That Next steps list
+  is a dated, verbatim record of what Nitra promised. It is the single highest-value
+  artifact in the stack.
+- **`Email:`** — full bodies including quoted history, so one Task can contain an entire
+  thread. This is how you find things people have forgotten, like a competitor's rate
+  offer buried in a reply about a marketing request.
+- **Aircall-only** — Description is just a recording URL, no summary. The content is
+  genuinely unknown. Say so; don't infer what was discussed.
+
+Also query `Event` the same way, and pull Contacts with Title and Email.
+
+Then Gmail (`search_threads` → `get_thread` with `messageFormat: PLAIN_TEXT`) and Slack.
+
+**Blind spot to state every time:** Gmail covers only lisa@nitra.com. Anything sent to
+amanda@, alex@, drew@ or support@ and never forwarded is invisible.
+
+## 3. Signals to hunt — run all of these every time
+
+Run the whole sweep even when the question looks narrow. These are the findings that turn
+an account review into a reason to call. Queries in `references/data-sources.md`.
+
+**Monthly spend against the limit that was in force.** For each of the last 13 months,
+compare that month's spend to the limit **in effect that month** — not today's limit. Sigma
+has no org-level monthly limit history, so build the timeline from the Slack credit-limit
+channel first. Any month over 100% means they cycled the line more than once and were
+paying mid-month to keep transacting; over 80% is a warning. Point-in-time utilization
+hides this completely.
+
+**Manual payments outside autopay and the statement cycle.** Pull every `PAYMENT_COMPLETE`
+row and separate scheduled autopay from manual — manual ones carry a description like
+"Payment - Manually Scheduled". Then check the timing against the statement due date. A
+large off-cycle manual payment almost always means the customer hit a wall and paid their
+way out of it. One account wired **$500,000** the morning after a decline, then ran a charge
+3.5× the declined one. Another made extra payments of $350K and $700K and wrote that it was
+*"an extra step to keep track of that I'd rather not have to keep up with on the fly"*.
+Every one of these is both a call reason and the strongest possible limit-increase argument.
+
+**Friction — all of it, last 6 months.** Sweep for anything that annoyed them, not only
+what looks like our fault. Declines of every reason code (a block from their own settings
+still cost them a purchase), cancelled and reissued cards, fraud blocks on legitimate spend,
+`webhook_timeout`, login and access failures, user invites that never arrived, receipt or
+accounting sync failures, statements they couldn't reconcile, marketing emails with wrong
+dates, and our own slow replies. Real ones found this way: a login problem that took three
+months to answer, a member invite that took six days and eleven emails, a customer who paid
+a large balance the day before a promotion because our email carried the wrong date.
+
+**Practice-side frustration in every Gong call.** Read each call for what they say about
+*their own* operations, not just about Nitra. Merchant fees they resent, a drug that isn't
+cardable, manual matching in QuickBooks Desktop, prior-auth workload, cash-flow timing, a
+new office they're opening, a distributor who ships late, a system migration eating their
+quarter. These are the openings that aren't about rate — and rate is usually the argument
+you can't win outright.
+
+**The full spending picture, on and off Nitra.** On us: monthly series, merchant
+concentration, MCC mix, average ticket, card and virtual-card counts. Off us: what they buy
+that we never see. Infer it from merchant names and from gaps — a retina practice buying
+1,000–1,200 syringes a month that runs only part of that through us is telling you where the
+rest goes. Corroborate with what they say on calls and with public sources (CMS NPI,
+provider and location counts). Then state plainly what share of their spend we hold.
+
+**Every CSM and AE transition, with dates.** Turnover is itself the finding. One account
+went Alex → Julia → Fred → Lauren → Lisa inside a year with a promised exec intro skipped in
+the middle, and its silence is entirely explained by that. Reconstruct from Task owners over
+time, "Update on your Nitra Account Team" emails, and handoff notes.
+
+**Other cards and payment rails.** Who else are they paying with — a named competitor
+(BofA, WEX, PNC, Corpay, a GPO card), an ACH or auto-draft arrangement with a distributor,
+or a bank card sitting behind ours as a fallback. One customer had configured BofA to catch
+every charge Nitra declined, so every ceiling hit silently handed volume to a competitor and
+nobody at Nitra knew.
+
+> **Migration signature:** transaction *count* rising while dollars fall means large-ticket
+> spend moved to another instrument while incidentals stayed on our card. One account went
+> $1.55M → $42.8K in a month while transaction counts went 99 → 163 → 154. Always chart
+> count and dollars together.
+
+**Who else at Nitra is already talking to them — right now.** Nitra is multi-threaded into
+every account: NitraMart AEs, sales AEs, solutions engineers, support, rewards, underwriting.
+Before sending anything, check Task owners and Gong participants for the last 60 days, not
+just CSM-owned activity, and search Slack for someone working the account. **Never cut
+across a live thread.** On one account a NitraMart AE had an open Avastin pricing
+conversation, the customer had just replied asking for numbers, and the AE was out of office
+— the right move was to own the meeting invite and let him bring the pricing, not to send a
+separate CSM email that would have landed as a second, uncoordinated Nitra voice. If someone
+else is mid-conversation, join it or sequence behind it, and say in your notes which it is.
+
+**The pitch ledger — everything we've ever asked them for.** Build a dated list: what was
+pitched or requested, by whom, when, and the outcome (accepted / declined / no reply / never
+followed up). Sources are the Gong Key Discussion Points and Next steps, logged `Email:`
+Tasks, and marketing sends. It does three jobs:
+
+- **Stops you re-pitching a stated no.** AI scheduling was declined by three separate
+  customers for three specific reasons — an elderly patient base, a preference for human
+  interaction, a system migration underway. Quoting their own reason back earns credit;
+  pitching it again blind burns it.
+- **Stops you asking twice for something already given.** One customer sent a complete
+  purchasing list in October; nine months later we asked for the same list again, never
+  having answered the first one.
+- **Surfaces the yeses nobody actioned** — a reference agreed to, logo permission granted,
+  P&L items or vendor contacts requested and never chased. These are the easiest calls to
+  make because the customer already said yes.
+
+Record the customer's stated reason for every no. It is almost always reusable.
+
+**Full tech stack.** EHR, practice management, accounting software, and anything else they
+run. Ask on every call, record it, and check it against the platform — an accounting
+connection that exists but hasn't synced in eight months is not a connection.
+
+> The examples throughout this skill are single observations from the Aug 2026 book review,
+> not established patterns. Treat them as illustrations of what to look for, and re-derive
+> the frequency before citing any of them as a tendency.
+
+## 4. Find the hook
+
+For every commitment in every Next steps list, ask one question: **did we do it?** Look
+for the delivery in email, Slack or the platform. Count the weeks if it isn't there.
+
+Across the whole book, the strongest hook is almost never a feature or a rate. Ranked by
+how often it wins:
+
+1. **An unkept commitment**, quoted verbatim with its date and how overdue it is.
+2. **A failure the customer felt that nobody mentioned** — a decline, a fraud pattern, a
+   webhook timeout, an unanswered support question.
+3. **A live competitive offer they volunteered.** Rarer than it feels. When a customer
+   tells you about a competing rate, they are inviting you to compete, not threatening —
+   and the record usually shows they have done it before and been answered with silence.
+
+Break ties on: did they raise it themselves, did it cost them money, is it still open,
+how recent.
+
+State plainly what you could not verify. Absence of evidence in Slack or Gmail is not
+evidence the thing didn't happen — search recall is imperfect. Write "the last one I can
+find" rather than "there were none".
+
+## 5. When the first touch fails
+
+Assume it will. Most contacts worth re-engaging have already ignored several emails, so a
+good first message not landing is the base case, not the exception. Do not write a better
+version of the same email to the same person.
+
+1. **Email** — the single strongest hook, one ask, one question at the end.
+2. **Wait 5–7 business days.** Chasing sooner reads as pressure.
+3. **Call the person it actually happened to**, not the relationship owner. The bookkeeper
+   whose card declined has more reason to pick up than the administrator who never saw it.
+4. **Switch contact** (triggers below).
+5. **Go up** — physician-owner, CEO, practice president — ideally through an internal warm
+   introduction rather than cold. Check whether an AE already has that relationship.
+6. **Mark dormant** with a date to revisit, and say so explicitly rather than letting it
+   drift. An account nobody has decided to stop working is worse than one you parked.
+
+**Switch contact when:** three touches have gone unanswered · the contact has left or their
+mailbox bounces · they are a gatekeeper who has never replied substantively · the ask is
+above their authority · someone else at the practice is visibly active on the platform while
+your contact is not.
+
+The strongest re-engagement move available is usually routing around a dead contact rather
+than writing better emails to them.
+
+## Deliverables
+
+Whatever is asked for, the shape is in `references/formats.md`:
+
+- **Call prep** — the hook, the evidence with dates, the opening line, what *not* to lead
+  with, and what to verify before dialling.
+- **Customer email** — Lisa's voice, not Claude's. Short, plain, no bullets or bold, one
+  direct question at the end. Read the voice section before drafting.
+- **Credit-limit request** — the Slack house format for Rich Kim, plus the evidence that
+  keeps it from stalling.
+- **Account plan / book-wide review** — HTML artifact plus Word doc when asked for a
+  deliverable rather than an answer.
+
+## Non-negotiables
+
+- **Draft only.** Never send an email or post to Slack without explicit approval. Offer;
+  don't act.
+- **Never assert a call, promise, quote, date or figure you have not seen in a record.**
+  Quote verbatim and cite the Task Id, Gong URL or Slack permalink so Lisa can check.
+- **Mark every inference as an inference,** inline, where it appears — not in a footnote.
+- **Correct your own earlier errors out loud** as soon as you find them, even mid-task,
+  and say what changed. Several of the most useful moments in this workflow have been
+  retractions.
+- **Never quote a decline count taken from Slack** — those alerts double-post. Sigma's
+  count is authoritative; anything else, name the merchant, date and amount instead.
+- **Merchant Name is NULL on declined transactions.** If you name the merchant, say it is
+  inferred from the same card's neighbouring charges — or leave it out of anything
+  customer-facing.
+- **Verify before the customer does.** If the email says a limit was raised, confirm it is
+  live in the platform first; the first thing they'll do is look.
