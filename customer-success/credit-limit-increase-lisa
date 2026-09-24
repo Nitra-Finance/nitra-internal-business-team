@@ -1,0 +1,129 @@
+---
+name: "credit-limit-increase-candidates"
+description: "Screen Nitra's customer book (or one CSM's book) for accounts to proactively offer a credit limit increase, with scoring factors, disqualifiers and per-account evidence, delivered as a slide deck and optional spreadsheet."
+---
+
+# Credit limit increase candidates
+
+Find customers whose Nitra credit limit is holding them back, rank them, and produce a deck that shows both the list and exactly how it was built, so leadership, CSMs and underwriting can trust it. Designed to run weekly (Monday) and on demand, by anyone in Customer Success or leadership.
+
+Why proactive increases: goodwill with the customer, less manual work for the practice, and spend growth (spend we currently decline or push onto other cards comes back to Nitra).
+
+## Before you start
+
+**Who is running it, and for whom.** Identify the person running the skill (Salesforce `getUserInfo`, or their name from the session). Use their name as "Prepared by" on the cover. Then decide scope:
+- **Whole book** (default for leadership or when unspecified).
+- **One CSM's book** when the person asks for "my accounts" or names a CSM: filter the final list to accounts whose current Salesforce owner is that person. Keep the funnel counts for the whole book so the rules slide still makes sense, and say the list is filtered.
+
+**Outputs.** Default: a Slides deck (Artifact tool, Slides type). Also produce on request:
+- **PowerPoint / Google Slides:** build the same deck as .pptx (pptx skill, pptxgenjs). Google Slides is made by uploading the .pptx to Drive; if you cannot upload it yourself, save it where the person can reach it and tell them the two clicks (Drive → New → File upload, then open with Google Slides).
+- **Spreadsheet:** .xlsx (xlsx skill) with live formulas, described in Step 5.
+
+**Access needed:** Sigma (read) and Salesforce (read). If either is unavailable, stop and say which one.
+
+## Data sources
+
+All platform data is in the Sigma workbook **Home - Customer Success BMS** (`workbookId` `1417509e-a805-42cc-be71-6650e0ea8773`). Call `begin_session` first. Query with `type: "workbook"`.
+
+| Element | ID | Use |
+|---|---|---|
+| All Accounts with Flags Master Table | `NeDlqANKtO` | One row per org for the latest month (`"yUM_VFNCTv" = true`): limit, balance, delinquency, autopay, tenure, quarterly spend buckets, owner |
+| All Transaction Details | `5fRvY0XHyY` | Every card transaction, payment, refund and decline. Type `d19ouYCBMs`, status/decline reason `DYUYvQd0Ue`, date `kPfUsFYu-s`, org `BdgzUvzBDx`, amount `-o1olzt7K0` |
+| Billing Cycle Details | `YPH3bYLLue` | Statements: `late_fee_amount`, `statement_generation_date` |
+
+Key column IDs on `NeDlqANKtO`: org `6SaKIn-RE2`, name `doNNJ1bdCT`, **CSM = Account Owner Name `DrvtzIc5XH`**, specialty `3Uu4INUmwp`, limit `t21ptpx2sB`, outstanding `2WSocg2Smq`, delinquency status `KA7RAbjV_Q`, days delinquent total (lifetime) `MJw5sUsYFz`, autopay `VRZdtcQlO2`, days on platform `9YUuxoZ_aD`, spend last 3M `Y-aQp2Mbsg`, spend 4–6M ago `BzqAHUfaJn`, 7–9M `mTRpYvrv_h`, 10–12M `fhuGCPE25W`, sent to collections `hwNCMSNFL6`, SFDC link `BzvJfSwFOh`, first transaction `ORZDB1OYMi`.
+
+If a query errors on an identifier, the workbook has changed: `describe` the element again and remap. Never guess column IDs.
+
+### Traps (each one has caused a real error)
+
+- **CSM comes from Account Owner Name (`DrvtzIc5XH`), never "Latest Salesforce Owner" (`trZ9zugsG9`)**, which is stale. Always confirm owners for the final list against live Salesforce: `SELECT Id, Name, Owner.Name FROM Account WHERE Id IN (...)` using the IDs in the SFDC links.
+- **Only `account_credit_limit_exceeded` counts as a limit decline.** `spending_control_exceeded` is a limit the customer set on their own cards (a settings review, not credit). `credit_limit_exceeded` is ambiguous and excluded.
+- **Decline data starts 2026-06-26.** Never set the decline window earlier than that, and say so in the deck until the history is longer than 90 days.
+- **Count decline days, not declines.** Declined charges retry and alerts double-post.
+- **Autopay and manual payments look the same** in this data. "Extra payments" = payments beyond one per calendar month in the last 90 days.
+- **Days delinquent is lifetime only.** Sigma has no 12-month delinquency count, and rebuilding one from statements and payments does not work (statement balance is not the amount due). The 12-month payment checks are "current today" and "no late fee in the last 12 months"; the lifetime field is only a backstop for serious past delinquency. Many current accounts carry 11–30 lifetime days, so a low lifetime cutoff wipes out most of the book.
+- **Some limits are placeholders** (for example $1). Exclude accounts with a limit under $1,000 as invalid data.
+- **The `Utilization` field is a lifetime average and wrong for this purpose.** Use outstanding ÷ limit (today) and monthly spend ÷ limit.
+- **Past months are compared with today's limit**; Sigma has no reliable monthly limit history.
+- **Limit declines alone surface distressed accounts** (maxed out, not paying, spend falling). The disqualifiers keep the list clean; never skip them.
+- **Two things are deliberately NOT disqualifiers** (CS policy): a recent limit change (a fresh increase that is already maxed out is a strong signal) and time on platform (newer accounts are in scope; flag very new ones in the evidence so the CSM can judge).
+
+## Step 1: Run the screen
+
+Compute dates from today: `M3_START` = first day of the month three months back, `M_END` = first day of the current month (the last 3 full months), `D90` = today minus 90 days (not earlier than 2026-06-26), `D365` = today minus 365 days. Substitute into the CTEs below, then run two queries: the funnel (`SELECT stage, COUNT(*) n FROM s GROUP BY 1 ORDER BY 1`) and the qualified list (`SELECT org, name, csm, spec, tier, lim, os, m80, m100, peak_sp, dec_days, dec_amt, extra_pays, growth, s3, s46, autopay, dqdays, dop, score, sfdc FROM s WHERE stage='9 qualified' ORDER BY score DESC, s3 DESC`).
+
+```sql
+WITH base AS (SELECT "6SaKIn-RE2" org, "doNNJ1bdCT" name, "DrvtzIc5XH" csm, "3Uu4INUmwp" spec, "t21ptpx2sB" lim, "2WSocg2Smq" os, "KA7RAbjV_Q" dq, COALESCE("MJw5sUsYFz",0) dqdays, "VRZdtcQlO2" autopay, "9YUuxoZ_aD" dop, COALESCE("Y-aQp2Mbsg",0) s3, COALESCE("BzqAHUfaJn",0) s46, "hwNCMSNFL6" coll, "BzvJfSwFOh" sfdc, "ORZDB1OYMi" first_txn FROM "workbook"."NeDlqANKtO" WHERE "yUM_VFNCTv" = true),
+ms AS (SELECT "BdgzUvzBDx" org, DATE_TRUNC('month', "kPfUsFYu-s") m, SUM("-o1olzt7K0") sp FROM "workbook"."5fRvY0XHyY" WHERE "d19ouYCBMs" IN ('CARD_TRANSACTION','NITRA_MART_TRANSACTION','REFUND') AND "kPfUsFYu-s" >= DATE '{M3_START}' AND "kPfUsFYu-s" < DATE '{M_END}' GROUP BY 1,2),
+mon AS (SELECT ms.org, SUM(CASE WHEN ms.sp >= 0.8*b.lim THEN 1 ELSE 0 END) m80, SUM(CASE WHEN ms.sp >= b.lim THEN 1 ELSE 0 END) m100, MAX(ms.sp) peak_sp FROM ms JOIN base b ON b.org=ms.org GROUP BY 1),
+tx AS (SELECT "BdgzUvzBDx" org, COUNT(DISTINCT CASE WHEN "DYUYvQd0Ue"='account_credit_limit_exceeded' THEN "kPfUsFYu-s" END) dec_days, SUM(CASE WHEN "DYUYvQd0Ue"='account_credit_limit_exceeded' THEN "-o1olzt7K0" ELSE 0 END) dec_amt, SUM(CASE WHEN "d19ouYCBMs"='PAYMENT' THEN 1 ELSE 0 END) pays, COUNT(DISTINCT CASE WHEN "d19ouYCBMs"='PAYMENT' THEN DATE_TRUNC('month', "kPfUsFYu-s") END) paymonths FROM "workbook"."5fRvY0XHyY" WHERE "kPfUsFYu-s" >= DATE '{D90}' GROUP BY 1),
+lf AS (SELECT "organization_id" org, SUM("late_fee_amount") late_fees FROM "workbook"."YPH3bYLLue" WHERE "statement_generation_date" >= DATE '{D365}' GROUP BY 1),
+j AS (SELECT b.*, COALESCE(m.m80,0) m80, COALESCE(m.m100,0) m100, m.peak_sp, COALESCE(t.dec_days,0) dec_days, COALESCE(t.dec_amt,0) dec_amt, COALESCE(t.pays,0) - COALESCE(t.paymonths,0) extra_pays, COALESCE(l.late_fees,0) late_fees, CASE WHEN b.s46>0 THEN (b.s3-b.s46)/b.s46 END growth FROM base b LEFT JOIN mon m ON m.org=b.org LEFT JOIN tx t ON t.org=b.org LEFT JOIN lf l ON l.org=b.org),
+s AS (SELECT j.*, (LEAST(dec_days,5)*3 + m100*3 + m80*2 + CASE WHEN peak_sp>=0.6*lim THEN LEAST(extra_pays,6)*2 ELSE 0 END + CASE WHEN growth>=0.5 THEN 4 WHEN growth>=0.2 THEN 2 ELSE 0 END + CASE WHEN autopay THEN 1 ELSE 0 END) score,
+ CASE WHEN first_txn IS NULL THEN '0 never transacted' WHEN COALESCE(lim,0)<1000 THEN '0b no valid limit' WHEN COALESCE(dq,'')<>'CURRENT' THEN '1 not current' WHEN COALESCE(coll,false) THEN '2 collections' WHEN late_fees>0 THEN '3 late fee 12m' WHEN dqdays>30 THEN '4 serious delinquency history' WHEN s3<15000 THEN '6 spend under 15K' WHEN s46>=5000 AND s3<0.7*s46 THEN '7 spend falling' WHEN os>=0.8*lim AND COALESCE(peak_sp,0)<0.5*lim THEN '7b balance carried not spend' WHEN NOT (dec_days>0 OR m80>=2 OR (extra_pays>=3 AND COALESCE(peak_sp,0)>=0.6*lim)) THEN '8 no constraint signal' ELSE '9 qualified' END stage,
+ CASE WHEN dec_days>0 OR m100>=1 THEN 'At the limit' ELSE 'Paying around it' END tier FROM j)
+```
+
+## The rules (shown on the deck)
+
+**Disqualifiers, applied in order** (an account counts against the first it fails): never transacted; no valid limit (under $1,000); not current (delinquent or defaulted today); sent to collections; any late fee in the last 12 months; serious delinquency history (more than 30 days delinquent, lifetime); under $15K spend in the last 3 months; spend down more than 30% vs prior 3 months (only when prior 3 months ≥ $5K); balance carried, not spent (≥80% utilized but peak month under 50% of the limit: a credit review, not an increase); no constraint signal.
+
+**Constraint signal (need at least one):** any limit decline in the last 90 days; spend ≥80% of limit in 2 of the last 3 full months; 3+ extra payments with a peak month ≥60% of limit.
+
+**Score (max 47):** 3 per limit-decline day (max 15); 3 per month at ≥100% of limit (max 9); 2 per month at ≥80% (max 6); 2 per extra payment (max 12, only if peak month ≥60%); +4 if spend up ≥50% vs prior 3 months, +2 if ≥20%; +1 autopay.
+
+**Tiers:** Priority = score ≥16. Watch list = everything else qualified. Pattern: "At the limit" (declined, or a month at ≥100%) vs "Paying around it" (no decline, pays often to stay under).
+
+**Indicative new limit** = the larger of (peak month ÷ 0.8) and (current limit × 1.25), rounded up to $5K under $100K, $25K under $1M, $100K above. Always label it a sizing aid for underwriting, never an approval.
+
+If CS leadership changes a threshold or weight, update it here, in the SQL, and in the spreadsheet's Scoring Rules defaults together.
+
+## Step 2: Build the evidence for each priority account
+
+Pull monthly detail from `5fRvY0XHyY` for the last 3 full months plus month to date: spend, payment count and dollars, limit-decline days, decline dollars and the largest single decline. Also use `mTRpYvrv_h` / `fhuGCPE25W` for the year-ago comparison.
+
+Write 2–4 sentences per account with concrete numbers, like:
+
+> Spent $72.7K, $78.7K and $75.6K (Jun–Aug) on a $50K line; September is already $84.2K. Makes 13–15 payments a month to keep the card working. Limit declines grew from 3 to 7 to 11 days a month, $157K declined in total. Never delinquent, about 23 months on Nitra.
+
+- Cover monthly dollars, the pattern over time, payment behaviour, decline trend, delinquency and tenure.
+- Mark every inference inline as "(inference)", e.g. spend dropping after declines may mean it moved to another card.
+- Flag anything a CSM should confirm before asking: any lifetime delinquent days (state the number), an account under 180 days on Nitra, a sudden month-to-date drop, the same decline amount repeating (a recurring charge failing).
+- Never quote a figure you did not see in the query results. Recheck every number before publishing.
+
+## Step 3: Verify owners
+
+Run the Salesforce owner query for every qualified account. If any differ from Sigma, use Salesforce and say so. Apply the CSM filter (if any) after this step.
+
+## Step 4: The deck
+
+Artifact tool: `quickstart` with intent `slides`, then create a new deck from the Slides type titled "Credit Limit Increase Candidates – Week of <Monday date>" (add "– <CSM name>" for a filtered run). New deck each week keeps a history; update an existing deck only when asked.
+
+Slides, in order:
+1. **Cover:** title, week, prepared by <person running it>, scope (whole book or CSM).
+2. **Summary:** accounts screened, qualified, priority, indicative added limit for the priority accounts (current → indicative totals), their combined monthly spend vs combined limits, one line on why proactive increases matter.
+3. **How the list is built:** three steps (screen out risk → confirm a real constraint → score, rank and size).
+4. **Scoring factors:** the six signals, why each matters, points; the qualification rule and the priority threshold.
+5. **Disqualifiers:** count removed by each rule; a callout on how payment history is judged (current today + no late fee in 12 months, with lifetime delinquency over 30 days as a backstop, because Sigma has no 12-month delinquency count); a callout that recent limit changes and time on platform are deliberately not disqualifiers.
+6. **Signals we would add with access to more data:** table of excluded signal / why it matters / why it is missing. Current list: days delinquent in the last 12 months (Sigma keeps a lifetime count only); bank balances and cash-flow trend (not in Sigma); returned or failed payments (Sigma shows completed payments only); manual vs. autopay payments (no payment description in this data); limit history by month (none in Sigma); declines before 2026-06-26; spend off Nitra and other cards (needs bank or accounting data); new providers and locations (not tracked as a trend); current financials or business credit (held by underwriting); customer requests and planned purchases (in Gong, email and Slack, not structured). Remove a row once that data is available and scored.
+7. **Two patterns:** At the limit vs Paying around it, counts and one real example each from this week's data.
+8+. **Priority accounts**, 3 per slide: rank, name, CSM, score, pattern, current → indicative limit, evidence.
+Then **Watch list** tables (about 11 rows per slide): account, CSM, limit, peak month %, decline days, extra payments, spend change, score.
+Last: **How to read the numbers** (decline window, extra-payment definition, today's limit vs past months, how payment history is judged, indicative limit is not an approval) and **the weekly process** (Monday refresh → CSMs review their accounts and check for live conversations → priority accounts go to underwriting with this evidence → CSM calls once the increase is live → thresholds reviewed after the first month).
+
+**Design:** institutional look; Source Serif 4 headings + IBM Plex Sans body in the Slides type (Georgia + Arial in .pptx); navy `#14213D`, light backgrounds `#F7F6F2` / `#ECEAE3`, teal `#1F6F63` for At the limit, amber `#9A5B13` for Paying around it. **No footer text and no speaker notes**: everything a reader needs is on the slides themselves.
+
+## Step 5: Spreadsheet (when asked)
+
+One .xlsx with tabs: **Summary** (headline totals and a by-CSM table, all formulas), **Candidates** (one row per qualified account: rank, account, org ID, CSM, specialty, list, pattern, score, current and indicative limit, increase, balance, utilization, monthly spend, peak, months near/over limit, decline days and dollars, extra payments, spend change, autopay, lifetime delinquent days, tenure, evidence, Salesforce link; priority rows highlighted, filters and frozen headers), **Scoring Rules** (every weight and threshold as a blue input cell that the Candidates formulas reference), **Disqualifiers** (counts plus a check that removed + qualified = screened), **Excluded Signals**, **Notes**. Score, list, pattern and indicative limit must be formulas. Recalculate and confirm every score and indicative limit matches the deck before delivering.
+
+## Step 6: Report back
+
+One or two sentences: how many qualified, how many priority, and what changed from the last run if one exists (new entrants, accounts that dropped off and why). Remind the person the deck and files are private until they share them.
+
+## Non-negotiables
+
+- Read-only. Never change a credit limit, post to Slack, email anyone or submit an underwriting request. The deck is the output; outreach and underwriting are the CSM's and leadership's call.
+- Customer data stays inside Nitra tools; do not publish decks or files anywhere public.
+- If a data source is unreachable, stop and say which one rather than producing a partial list.
