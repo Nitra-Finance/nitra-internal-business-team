@@ -1,0 +1,496 @@
+# Closed-Lost & Current-Customer Analysis
+
+*Nitra internal skill documentation — converted from `closed-lost-analysis-skill.skill`*
+
+Monthly closed-lost and current-customer analysis for Nitra, re-derived from primary sources (Sigma, Salesforce, Gong call briefs) rather than inherited spreadsheet hypotheses. Pulls the $500K+ population for a time window, resolves Salesforce IDs, fans out evidence-based extraction per deal (why it died / why it won, death moment, stall stage, reason tags, GPO channel and spend, adoption state, risk signals), scores re-engagement, and builds a formula-driven Excel workbook plus an optional deck.
+
+Use this whenever John asks for the closed-lost analysis, loss reasons, win/loss review, churn or at-risk read on customers, GPO/purchasing-channel columns, re-engagement gameplan, or "run the monthly" — even if he doesn't say "closed lost" explicitly. Also use it when asked to refresh, redo, or extend any earlier version of this analysis.
+
+A repeatable, evidence-first pipeline. The point of this skill is that every claim about why a deal died or how a customer is doing traces to a dated quote in Salesforce or Gong. The original monthly sheet's analyst hypotheses turned out to be wrong for 226 of 246 deals once checked against sources, so do not shortcut the primary-source pass.
+
+---
+
+## Table of contents
+
+1. [Two modes](#two-modes)
+2. [Run-time switches](#run-time-switches)
+3. [Workflow](#workflow)
+4. [Things that will bite you](#things-that-will-bite-you)
+5. [Reference: Data sources, IDs and tool quirks](#reference-data-sources-ids-and-tool-quirks)
+6. [Reference: Subagent prompt — closed-lost extraction](#reference-subagent-prompt--closed-lost-extraction)
+7. [Reference: Subagent prompt — current-customer extraction](#reference-subagent-prompt--current-customer-extraction)
+8. [Reference: Subagent prompt — GPO / purchasing-channel extraction](#reference-subagent-prompt--gpo--purchasing-channel-extraction)
+9. [Reference: Reason tags, product-vs-access split, and re-engagement score](#reference-reason-tags-product-vs-access-split-and-re-engagement-score)
+10. [Reference: QA'ing a large deck without LibreOffice timing out](#reference-qaing-a-large-deck-without-libreoffice-timing-out)
+11. [Scripts](#scripts)
+
+---
+
+## Two modes
+
+| Mode | Population | Output register | Reference prompt |
+|---|---|---|---|
+| **lost** (default) | Closed Lost, Amount ≥ $500K, closed in window | one row per opportunity: hypothesis, death moment, stall stage, reason tags, GPO, score | "Subagent prompt — closed-lost extraction" |
+| **customers** | Closed Won, Amount ≥ $500K, closed in window | adoption state, why won, displaced card, GPO, blockers, risk, expansion | "Subagent prompt — current-customer extraction" |
+
+Run both when asked for "the monthly" with no qualifier. Run one when the request names it.
+
+## Run-time switches
+
+*(confirm only if the request is ambiguous)*
+
+- **Window** — default is the prior calendar month by CloseDate. Accept "trailing 12 months", "all-time", or an explicit date range. Say which one you used in the deliverable's Read Me.
+- **Threshold** — default $500,000 on Amount. Accept an override.
+- **Deliverable** — Excel workbook always. Add the PowerPoint deck only when asked ("deck", "slides", "presentation"). Upload to Drive only when a folder is named.
+- **Score source** — derive re-engagement 1-5 from evidence (rule under [Reason tags](#reference-reason-tags-product-vs-access-split-and-re-engagement-score)). If John names a Salesforce field, read that instead.
+
+## Workflow
+
+Work in `outputs/<mode>-<YYYY-MM>/` so months don't overwrite each other.
+
+### 1. Pull the population
+
+Prefer Sigma for the closed-lost list because it carries Closed Lost Reason, Last Activity and Last Person Contacted that Salesforce reports don't surface cleanly; fall back to SOQL if Sigma is unavailable. Exact workbook, element and column IDs are under [Data sources](#reference-data-sources-ids-and-tool-quirks) — call `begin_session` first, every conversation.
+
+```sql
+-- Sigma, closed-lost element, prior month
+SELECT "CvygWWqRyn" AS opp_id, "RLhi4hq-PH" AS account, "SEGyFNBp5P" AS credit_limit,
+       "K2yOt9DptC" AS lost_reason, "ZH7p0B4KSh" AS entered_cl, "JD2XDB5XLB" AS owner,
+       "4Ie0cOf1NV" AS last_activity, "WP-hlKw02b" AS last_person, "JgVRzsywEi" AS specialty
+FROM "workbook"."nSLaNw3bGT"
+WHERE "SEGyFNBp5P" >= 500000 AND "ZH7p0B4KSh" >= '<window start>' AND "ZH7p0B4KSh" < '<window end>'
+```
+
+For customers use SOQL directly: `StageName = 'Closed Won' AND Amount >= 500000 AND CloseDate >= ... AND CloseDate < ...`.
+
+Large results spill to a file under `.claude/projects/.../tool-results/`. Parse that file with `mcp__workspace__bash` + python; don't re-query. Save the population as `population.json`, then run:
+
+```bash
+python scripts/make_batches.py population.json --mode lost --size 25
+```
+
+This writes `batches/batch_NN.json`. Batch size 25 keeps each subagent's Salesforce activity pull inside its context budget.
+
+### 2. Fan out the primary-source extraction
+
+Spawn one subagent per batch, **all in the same turn**, using the prompt in the "closed-lost extraction" or "current-customer extraction" reference verbatim (substitute the batch file path and output path). Each subagent writes `batches/out_NN.json`. The prompts already encode the Salesforce quirks that cost time when learned fresh — read [Data sources](#reference-data-sources-ids-and-tool-quirks) if you need to debug one.
+
+Do not let a subagent summarize the raw JSON back to you; ask only for the compact summary the prompt specifies. Your context is the scarcest resource in this pipeline.
+
+If a batch fails, rerun only that batch. Never merge with a missing batch — the row order of the register depends on every batch being present.
+
+### 3. Merge, tag and score
+
+```bash
+python scripts/merge_batches.py --mode lost --population population.json --batches batches/ --out final.json
+```
+
+The merge script joins outputs back to the population by position and name, asserts zero mismatches, computes the reason-tag statistics, derives the re-engagement score, and flags record-hygiene problems (backfills, duplicates, not-a-loss). It prints the headline numbers — read them; if a number looks wrong, it usually means a batch drifted from its input order.
+
+For the customers mode use `--mode customers`; it computes adoption-state and risk distributions instead.
+
+### 4. GPO / purchasing channel
+
+*(lost mode, if asked or if the request mentions GPO, Besse, McKesson, purchasing, or contracts)*
+
+Run a second, lighter fan-out with the "GPO / purchasing-channel extraction" reference (batches of ~80 — it's keyword-driven, not a full read). Build the GPO batches from `final.json` so every row carries its oppId:
+
+```bash
+python scripts/make_batches.py final.json --mode gpo --out gpo_batches/
+# … spawn the GPO subagents, one per gpo_batches/batch_NN.json → gpo_batches/out_NN.json …
+python scripts/merge_batches.py --mode gpo --population final.json --batches gpo_batches/ --out final.json
+```
+
+The merge joins on oppId, so the sort order of the GPO batches doesn't have to match `final.json`. It appends `gpo`, `gpoType`, `gpoSpend`, `gpoEvidence` and normalizes the phonetic variants that come off call transcripts (Bessie → Besse Medical, Medavant → Medivant, Terbear → Turbare). The customers-mode prompt already captures GPO, so this step is lost-mode only.
+
+### 5. Write the narrative, then build the deliverables
+
+The builders take a `narrative.json` with that month's takeaways and actions. Write it yourself from the merge headline numbers and a read of `final.json` — never reuse last month's. Without it the summary tabs carry visible `[WRITE FROM EVIDENCE]` placeholders, which is deliberate: a workbook with stale narrative is worse than one with none.
+
+```json
+{"takeaways": [{"title": "...", "metric": "$X", "metricLabel": "short label", "detail": "one or two sentences with a real number and a named account"}],
+ "actions":   [{"title": "verb-first", "owner": "team", "target": "$ or count at stake", "rationale": "why this, grounded in a finding"}]}
+```
+
+Four to six takeaways, five to seven actions. A good takeaway names a number and an account; a good action names an owner and what it unlocks. Lead with the access-vs-product split and the record-hygiene share, because those two reframe everything else. On the customer side, lead with the adoption distribution (how much approved limit is actually being used) and the named at-risk accounts.
+
+```bash
+python scripts/build_lost_workbook.py final.json --out Nitra_ClosedLost_<YYYY-MM>.xlsx --narrative narrative.json --window "August 2026"
+python scripts/build_customer_workbook.py final.json --out Nitra_Customers_<YYYY-MM>.xlsx --narrative narrative.json --window "August 2026"
+node scripts/build_lost_deck.js final.json Nitra_ClosedLost_<YYYY-MM>.pptx --narrative narrative.json --window "August 2026"   # only if a deck was asked for
+```
+
+`build_lost_deck.js` needs `pptxgenjs`; it's preinstalled in the Cowork sandbox, otherwise `npm install pptxgenjs` in the working directory.
+
+Then, without exception, recalculate and verify. Copy the workbook to a fresh `/tmp` directory first: LibreOffice leaves a `.~lock.<name>#` file behind that can't be deleted under `outputs/`, and a second recalc in the same directory then hangs silently with an empty log. The run takes 30-60 s, so detach it:
+
+```bash
+mkdir -p /tmp/rc && cp <workbook>.xlsx /tmp/rc/ && cd /tmp/rc
+setsid nohup python <xlsx-skill>/scripts/recalc.py <workbook>.xlsx 120 > rc.log 2>&1 < /dev/null & disown
+sleep 40; cat rc.log          # must report total_errors: 0 — then copy the recalculated file back
+```
+
+Recalc proves formulas evaluate, not that they're right. Open the recalculated file with `openpyxl` (`data_only=True`) and check that the Executive Summary totals equal the Python-computed totals from `final.json`. The merge script prints those numbers for exactly this comparison. If they differ, the register's ranges or the sort order are off — fix the builder, don't hand-edit cells.
+
+For the deck, validate with the pptx skill's `validate.py`, render a subset to images (LibreOffice will time out on 270 slides — build a QA subset first, see [QA'ing a large deck](#reference-qaing-a-large-deck-without-libreoffice-timing-out)), and look at the title, summary, one reasons page, one overview page, and two deal slides including the longest practice name.
+
+### 6. Deliver
+
+Present the files. Lead the reply with the two or three findings that would change what someone does this month — not with a description of the workbook. State the window and threshold used, the count and dollar total, and the record-hygiene share up front, because a quarter of records in the source system are typically duplicates, backfills or not real losses, and that bounds every other number.
+
+## Things that will bite you
+
+- **Subagents can't write to `/sessions/...` with the Write tool.** The extraction prompts tell them to write JSON via bash; if a subagent reports it "couldn't save", that's why.
+- **Task.Description is not LIKE-filterable in this Salesforce org.** Keyword searches must go through SOSL (`find`) or a local dump parsed with python. The extraction prompts already say this; don't let a subagent burn 20 calls discovering it.
+- **Backfilled records.** Opportunities created 2025-08-30 with earlier close dates are Pipedrive imports with no contemporaneous activity. Any "8+ calls" narrative on them comes from later re-prospecting cycles. The honest hypothesis is "no contact on record before close."
+- **Activity lives at account level for won deals.** Query Task by AccountId as well as WhatId, or you'll conclude a live customer is dormant.
+- **Amounts are credit limits, not revenue.** Say so in every deliverable.
+- **A quarter of rows aren't what the stage says.** Duplicates, added EINs under an existing account, underwriting-only shells, accounts that later signed up. Flag rather than silently drop; RevOps needs the list.
+- **Multi-EIN in "Features Valued" means interest, not cause of death.** The first pass over-weighted it 6×. Tag a reason only when the sources show it blocked the deal.
+- **LibreOffice hangs on big decks and on stale profiles.** Kill `soffice`, render a subset, or run conversion detached with `setsid nohup`.
+
+---
+
+## Reference: Data sources, IDs and tool quirks
+
+### Sigma
+
+Always call `begin_session` once per conversation before any other Sigma tool.
+
+**Workbook:** Sales Metrics — `44965f92-b94d-4511-9ddd-f72abaf5338f`
+(URL: https://app.sigmacomputing.com/nitra-healthcare/workbook/Sales-Metrics-25qcl6QaswwXePWbnEtp71)
+
+**Element:** "All closed lost opportunities" — `nSLaNw3bGT`. Query with `type: "workbook"`, `workbookId` above, and `FROM "workbook"."nSLaNw3bGT"`. All identifiers must be double-quoted.
+
+| Column ID | Meaning |
+|---|---|
+| `CvygWWqRyn` | Opportunity ID (Salesforce 006… id — this is the join key) |
+| `YVU-fW6ROJ` | Account ID |
+| `RLhi4hq-PH` | Account Name |
+| `JgVRzsywEi` | Specialty |
+| `SEGyFNBp5P` | Credit Limit (number; what the sheet calls "Deal Amount") |
+| `HhY2DfBveN` | Created At |
+| `ZH7p0B4KSh` | Entered Closed Lost (datetime; NULL on backfilled legacy rows) |
+| `K2yOt9DptC` | Closed Lost Reason (SFDC picklist) |
+| `JD2XDB5XLB` | Owner Name |
+| `qZ0sRAueMS` | Activities Completed Before Demo Conducted |
+| `4iGjXEk5c7` | Deal Source Details |
+| `4Ie0cOf1NV` | Last Activity Date |
+| `WP-hlKw02b` | Last Activity Person Contacted |
+
+Quirks:
+- Results also return `--metric-[...]` columns you didn't ask for. Ignore them.
+- `ORDER BY "ZH7p0B4KSh" DESC` puts NULLs first. Filter `IS NOT NULL` when you want true recency.
+- The population at ≥$500K was 248 rows all-time in July 2026, essentially matching the 246-row master sheet. Use Sigma as the authoritative join key rather than fuzzy name matching against a sheet.
+- No "Opportunities - detail" data model is exposed as a standalone object; per-opportunity stage-entry dates are not available. Stall stage must come from activity evidence, not Sigma.
+
+Other useful elements in the same workbook: `907Wl732Vs` All open opportunities, `nWyHrkXe_V` Conversion funnel, `EmuGkIpzbK` Avg days in stage (aggregated only).
+
+### Salesforce (SOQL / SOSL)
+
+Tools: `mcp__cc5af9f6-…__soqlQuery` and `mcp__cc5af9f6-…__find` (SOSL).
+
+**Population (customers mode):**
+
+```sql
+SELECT Id, Name, AccountId, Account.Name, Amount, CloseDate, CreatedDate, Owner.Name, LeadSource
+FROM Opportunity
+WHERE StageName = 'Closed Won' AND Amount >= 500000
+  AND CloseDate >= 2026-08-01 AND CloseDate < 2026-09-01
+ORDER BY Amount DESC
+```
+
+**Opportunity detail (both modes):**
+
+```sql
+SELECT Id, Name, Amount, StageName, CloseDate, CreatedDate, Description, NextStep,
+       LeadSource, Owner.Name, Account.Name, AccountId
+FROM Opportunity WHERE Id IN ('006…','006…')
+```
+
+`Description` holds the rep's own loss notes — it's the field that fed the old sheet's "SFDC Notes".
+
+**Activity (the evidence):**
+
+```sql
+SELECT WhatId, AccountId, Subject, ActivityDate, Type, Description
+FROM Task WHERE WhatId IN ('006…', …) ORDER BY ActivityDate DESC
+```
+
+and, essential for won deals:
+
+```sql
+… FROM Task WHERE AccountId IN ('001…', …) ORDER BY ActivityDate DESC
+```
+
+Gong records have `Subject` starting `[Gong` and `Description` containing `Call brief:`, `Key Discussion Points:`, `Next steps:`. Records whose brief is only "Call reached gatekeeper" / "reached voicemail" carry no content but do count as access-failure evidence.
+
+Quirks that cost real time when rediscovered:
+- **`Task.Description` cannot be filtered with `LIKE`** in this org. For keyword searches use SOSL: `FIND {Besse} RETURNING Task(Id, WhatId, AccountId, Subject, ActivityDate, Description), Opportunity(Id, Name, Description, NextStep)`. Or dump activity for the batch to a file and grep it locally.
+- Several fields you'd expect don't exist: no `LossReason__c`, no GPO field, no re-engagement score. Don't guess field names — query `getObjectSchema` if needed.
+- Query timeouts (180 s) happen on broad aggregates. Narrow the WHERE.
+- An opportunity can have zero Task rows while its Account has hundreds. Always check both.
+- Opportunities created `2025-08-30T05:36–09:36Z` are Pipedrive backfills. Their CloseDate predates any activity. Treat "activity before close" as absent.
+
+### Where big tool results land
+
+Any tool result over the token limit is auto-saved and the message tells you the path. From bash it is under:
+`/sessions/<session>/mnt/.claude/projects/<escaped-cwd>/<uuid>/tool-results/<server>-<tool>-<ts>.txt`
+
+The JSON shape is preserved (`{"columns":[…],"rows":[…]}` for Sigma, `{"records":[…]}` for SOQL). Parse it with python; never try to `Read` it line by line.
+
+### Google Drive
+
+`read_file_content` silently truncates large sheets (it cut a 246-row sheet to 90 rows once). To read a full spreadsheet, use `download_file_content` with `exportMimeType: application/vnd.openxmlformats-officedocument.spreadsheetml.sheet`, base64-decode, and open with openpyxl. Drive has no cell-level write; to get data into an existing Google Sheet, upload a lookup sheet with `create_file` (CSV converts to a Sheet) and give the user an `IMPORTRANGE`/`VLOOKUP` pair, or use Claude in Chrome when it's connected.
+
+### Gong
+
+Gong is not a direct connector here. Its call briefs are synced into Salesforce Task descriptions, which is where this pipeline reads them. Deep links (`https://us-44470.app.gong.io/call?id=…`) appear inside those descriptions and can be surfaced in the deliverable.
+
+---
+
+## Reference: Subagent prompt — closed-lost extraction
+
+Spawn one `general-purpose` subagent per batch, all in one turn. Replace `{{BATCH}}` and `{{OUT}}` with the batch input path and output path. Keep everything else verbatim; each line below exists because its absence cost a prior run time or accuracy.
+
+> You are re-deriving the reason a set of closed-lost Nitra sales deals actually died, using PRIMARY SOURCE data from Salesforce (including Gong call recordings/summaries logged as Salesforce Task records).
+>
+> **INPUT:** `{{BATCH}}` — a JSON array of deals, each with: practice, opportunity, oppId (Salesforce Opportunity Id), accountId, amount, closeDate, sheetLossReason, and optionally sheetHypothesis / sheetDeathMoment / sheetNotes from an earlier analysis (treat those as hypotheses to check, never as evidence).
+>
+> **COMPANY CONTEXT:** Nitra sells a Visa credit card for independent medical practices (~2.2% cashback on medical/healthcare spend), a spend-management/AP platform (QuickBooks integration), and "NitraMart", a medical supply marketplace with 5-10% back on select injectables (e.g. Avastin). Heavily ophthalmology/retina. Competitors named in deals: Amex, Capital One, Chase, WEX, Corpay, Ramp, Bill.com/Divvy, Comdata, PNC. Purchasing channels/GPOs: Besse Medical, McKesson (incl. OnMark Vision GPO), CuraScript SD, AmerisourceBergen/Cencora, Cardinal Health, Henry Schein, Medline, Biocare, Ally GPO; Medivant, Turbare and Northmark are Avastin compounders/repackagers.
+>
+> **STEP 1** — Pull primary sources via `mcp__cc5af9f6-21f2-4dda-afce-989ccc5c69d6__soqlQuery`:
+> (a) Opportunity fields, batched ~12 oppIds per query:
+> `SELECT Id, Name, Amount, StageName, CloseDate, CreatedDate, Description, NextStep, LeadSource, Owner.Name, Account.Name, AccountId FROM Opportunity WHERE Id IN ('...','...')`
+> (b) Activity history, 3-5 oppIds per query:
+> `SELECT WhatId, AccountId, Subject, ActivityDate, Type, Description FROM Task WHERE WhatId IN ('...','...') ORDER BY ActivityDate DESC`
+> If an opportunity has zero Task rows, query by AccountId instead and note "account-level activity only" in the death moment.
+> Gong records have Subjects starting "[Gong"; Descriptions contain "Call brief:", "Key Discussion Points:", "Next steps:" — the richest evidence. "Reached gatekeeper"/"reached voicemail" records carry no product signal but DO count as evidence of an access problem.
+>
+> **IMPORTANT:** `Task.Description` is NOT filterable with LIKE in this org. Do not try. For keyword searches use SOSL via `mcp__cc5af9f6-21f2-4dda-afce-989ccc5c69d6__find`.
+>
+> **CRITICAL** — check that activity falls BEFORE the opportunity's CloseDate. Earlier analyses quoted calls that postdated the close by 6-23 months, from later re-prospecting cycles or sibling records. If the only activity postdates the close, the honest hypothesis is "no contact on record before close." Opportunities created 2025-08-30 with earlier close dates are Pipedrive backfills — expect exactly this.
+>
+> Watch for records that are not real losses: duplicates (created seconds apart, identical amounts), test/error records ("ENTERED WRONG Account"), accounts that later signed up or have a Closed Won sibling, added EINs under an existing customer. Flag these plainly in contradictionNote and set stallStage honestly.
+>
+> **CONTEXT MANAGEMENT:** Task Descriptions run 1-3k chars. Never pull all deals' activity at once. Work in small chunks. If a tool result is auto-saved to a file for being too large, use `mcp__workspace__bash` with jq/python to extract only the fields you need. Do not hold raw activity text for the whole batch in context.
+>
+> **STEP 2** — For each deal write:
+> - `hypothesis` — 1 sentence (max ~150 chars), the real reason the deal died, specific and concrete. Name the actual blocker: competitor and rate, named vendor, specific missing feature, who blocked it. If sources show only unanswered outreach, say so and quantify ("14 calls, never past the gatekeeper").
+> - `deathMoment` — 2-3 sentences (max ~420 chars) on the last meaningful interaction and what killed it. Quote or closely paraphrase real language and include the date. Evidence, not speculation.
+> - `stallStage` — one of: "no contact", "gatekeeper only", "champion engaged", "champion demo", "DM demo", "verbal/late stage". A demo must be evidenced by a real meeting, not a 1-minute unanswered call.
+> - `gapTags` — 0-3 from EXACTLY: `["dm-access","multi-ein","cashback-rate","accounting-integration","switching-cost","vendor-acceptance","gpo-lockin","trust","float-terms","emr-conflict","not-icp","champion-turnover","tax-treatment","no-engagement"]`. Tag only what the sources show blocked the deal — a feature the prospect was interested in is not a cause of death.
+> - `evidenceStrength` — "strong" | "moderate" | "weak"
+> - `contradictsOld` — true if your read materially differs from sheetHypothesis when one was supplied; if none was supplied, compare against sheetLossReason (the SFDC picklist) instead — a deal filed as "Not a Priority" that actually died on a competitor rate is a contradiction worth surfacing
+> - `contradictionNote` — one short sentence if contradictsOld, else ""
+> - `gongLink` — the first https://…gong.io/call?id=… URL found in the evidence, else ""
+>
+> **HONESTY REQUIREMENT:** Never invent detail or attribute a quote not in the data. Thin sources → evidenceStrength "weak" and a hypothesis stating only what is knowable. "Only two logged voicemails; no substantive contact on record" is a better answer than a plausible-sounding objection.
+>
+> **OUTPUT:** Write the file with `mcp__workspace__bash` (python3 json.dump) — the Write/Edit file tools cannot reach `/sessions/...` paths. Write a JSON array to `{{OUT}}` — one object per input deal, same order, with exactly these keys: practice, opportunity, oppId, hypothesis, deathMoment, stallStage, gapTags, evidenceStrength, contradictsOld, contradictionNote, gongLink. Validate: `python3 -c "import json;d=json.load(open('{{OUT}}'));print(len(d))"` must print the input count.
+>
+> Return ONLY a compact summary under 200 words: count processed, stallStage and evidenceStrength distributions, contradictsOld count, top gapTags, 2-3 most notable corrections, and any non-loss/duplicate records found. Do NOT paste the JSON.
+
+---
+
+## Reference: Subagent prompt — current-customer extraction
+
+One `general-purpose` subagent per batch, all spawned in one turn. Replace `{{BATCH}}` and `{{OUT}}`.
+
+> Build an evidence-based profile of a set of CURRENT Nitra customers (Closed Won deals) from Salesforce primary sources including Gong call recordings/summaries.
+>
+> **INPUT:** `{{BATCH}}` — a JSON array with: oppId (Salesforce Opportunity Id), opportunity, accountId, account, amount, closeDate, createdDate, owner, leadSource, accountDupCount.
+>
+> **COMPANY CONTEXT:** Nitra sells a Visa card for independent medical practices (~2.2% cashback on medical/healthcare spend, 2% other business spend), a spend-management/AP platform (QuickBooks integration), and "NitraMart", a supply marketplace with 5-10% back on select injectables (notably Avastin). Heavily ophthalmology/retina. Competitors: Amex, Capital One, Chase, WEX, Corpay, Ramp, Bill.com/Divvy, Comdata, PNC. Purchasing channels/GPOs: Besse Medical, McKesson (incl. OnMark Vision GPO), CuraScript SD, AmerisourceBergen/Cencora, Cardinal Health, Henry Schein, Medline, Biocare, Ally GPO; Medivant, Turbare and Northmark are Avastin compounders/repackagers.
+>
+> **EXTRACTION** — use `mcp__cc5af9f6-21f2-4dda-afce-989ccc5c69d6__soqlQuery`:
+> (a) Opportunity detail, ~12 oppIds per query:
+> `SELECT Id, Name, Amount, StageName, CloseDate, CreatedDate, Description, NextStep, Owner.Name, Account.Name, AccountId FROM Opportunity WHERE Id IN ('...',...)`
+> (b) Activity, 3-5 ids per query, by WhatId AND by AccountId — for won deals most post-sale conversation is logged against the account, not the opportunity:
+> `SELECT WhatId, AccountId, Subject, ActivityDate, Type, Description FROM Task WHERE WhatId IN (...) ORDER BY ActivityDate DESC`
+> `SELECT WhatId, AccountId, Subject, ActivityDate, Type, Description FROM Task WHERE AccountId IN (...) ORDER BY ActivityDate DESC`
+> Gong records have Subjects starting "[Gong"; Descriptions contain "Call brief:", "Key Discussion Points:", "Next steps:".
+>
+> `Task.Description` is NOT filterable with LIKE in this org; use SOSL (`find`) for keyword searches.
+>
+> **CONTEXT MANAGEMENT:** Won accounts have long histories. Never pull all accounts at once. If a tool result is auto-saved to a file, use `mcp__workspace__bash` with jq/python to extract only the fields you need. Consider dumping the batch's activity to a local file once and grepping it per account.
+>
+> **KNOWN TRAPS:** Many 2025 opportunities were backfilled on 2025-08-30 with backdated close dates and no pre-close discovery — leave displacedCard empty rather than guessing. Records that are NOT genuine new customers appear regularly: byte-identical Pipedrive double-loads created seconds apart, underwriting-approval-only shells with $0 balances, added EINs under an existing customer, dormant never-activated logos, same-day record artifacts, accounts that asked Nitra to close. Flag these clearly in "blockers". Recurring themes worth checking for (but never assuming): Avastin price vs Northmark ~$30, Turbare exiting pre-filled syringes, McKesson ACH-only contracts, GPO pricing Nitra can't honour, QuickBooks/Sage Intacct sync failures, credit-limit ceilings, CSM handoff gaps.
+>
+> **FOR EACH customer produce:**
+> - `account`, `oppId`, `amount` (copy from input)
+> - `whyWon` — 1 sentence (max ~160 chars), the specific reason they chose Nitra, grounded in sources. Name the driver. If sources don't say: "Not evidenced in sources."
+> - `displacedCard` — card/vendor Nitra displaced or supplemented. "" if unknown.
+> - `competitiveSet` — other vendors evaluated, comma-separated. "" if none.
+> - `gpo` — named GPO/distributor/compounder, normalized. Multiples joined " / ". "" if not named. Never a card/fintech.
+> - `gpoSpend` — stated spend through that channel, unit-preserving ("$1.5M/month", "~200 Avastin syringes/week"). "" if not stated.
+> - `adoptionState` — "fully ramped" | "partially adopted" | "onboarding" | "stalled/low usage" | "at risk" | "unknown", from post-close evidence.
+> - `blockers` — friction limiting adoption/expansion, 1 sentence. "" if none.
+> - `riskSignals` — explicit warning signs in recent activity (rate complaints, competitor pitch, champion departure, vendor friction, limit constraints, service issues), 1 sentence. "" if none.
+> - `expansionAngle` — concrete, evidence-backed growth opportunity, 1 sentence. "" if none.
+> - `keyContact` — named champion/DM with title if available.
+> - `evidenceStrength` — "strong" | "moderate" | "weak"
+> - `notableQuote` — one verbatim quote (max ~200 chars) with a date. "" if none.
+>
+> **HONESTY:** Only record what sources say. Never invent a quote, a GPO, or a spend figure. Empty strings are correct and expected.
+>
+> **OUTPUT:** Write the file with `mcp__workspace__bash` (python3 json.dump) — the Write/Edit file tools cannot reach `/sessions/...` paths. JSON array to `{{OUT}}`, one object per input, same order, exactly the keys above. Validate with `python3 -c "import json;d=json.load(open('{{OUT}}'));print(len(d))"`.
+>
+> Return ONLY a summary under 220 words: count, adoptionState and evidenceStrength distributions, GPO and spend coverage, common displacedCard values, and the 3 most notable findings (biggest expansion angles or risk signals, with account names). Do NOT paste the JSON.
+
+---
+
+## Reference: Subagent prompt — GPO / purchasing-channel extraction
+
+*(lost mode add-on)* Lighter than the full extraction: it's keyword-driven, so batches of ~80 are fine. One subagent per batch. Replace `{{BATCH}}` and `{{OUT}}`.
+
+> Extract two facts — the GPO / group-purchasing or drug-distribution relationship, and the spend volume through it — for a set of Nitra deals, using Salesforce as the primary source.
+>
+> **INPUT:** `{{BATCH}}` — array of objects with: practice, oppId, accountId, amount, specialty.
+>
+> **BACKGROUND:** Practices buy drugs (Avastin, Eylea, Lucentis, triamcinolone) and supplies through GPOs, buying groups, wholesalers, distributors or compounders. Names seen in this data: Besse Medical, McKesson (incl. OnMark Vision GPO), CuraScript SD, AmerisourceBergen/Cencora, Cardinal Health, Henry Schein, Medline, ASD Healthcare, Biocare, Ally GPO, Rho, Vantage, Benco, Bell Medical, Retina Alliance, HealthTrust, Morris Dickson, Leiters, US Retina GPO; Medivant, Turbare and Northmark are Avastin compounders. Cards/fintechs (WEX, Corpay, Ramp, Bill.com, Divvy, Amex, Chase, Capital One, Comdata) are NOT purchasing channels — never put them in the gpo field.
+>
+> **METHOD** — `Task.Description` is NOT filterable with LIKE in this org. Use:
+> - SOSL via `mcp__cc5af9f6-21f2-4dda-afce-989ccc5c69d6__find`: `FIND {Besse} RETURNING Task(Id, WhatId, AccountId, Subject, ActivityDate, Description), Opportunity(Id, Name, Description, NextStep)`. Repeat for: Besse, Bessie, McKesson, Curascript, AmerisourceBergen, Cencora, Cardinal, "Henry Schein", Medline, ASD, Biocare, GPO, "group purchasing", "buying group", distributor, wholesaler, compounding, Ally, Medivant, Medavant, Turbare, Terbear, Northmark. Keep only hits whose WhatId or AccountId is in your batch.
+> - Also read Opportunity Description and NextStep for all your oppIds (batch ~40 per SOQL query).
+> - For deals where a channel was found, read that account's full Task history for spend figures (per week / per month / annually / syringes / % of spend).
+> - Route large results to files and parse with `mcp__workspace__bash`; don't hold them in context.
+> - Exclude Nitra's own marketing boilerplate (outbound emails that list McKesson/Medline as NitraMart vendors are not evidence about the prospect).
+>
+> **FOR EACH deal output:**
+> - `practice`, `oppId` (copy)
+> - `gpo` — named channel, normalized ("Besse Medical", "McKesson", "CuraScript SD", "Ally GPO"). Multiples joined " / ". "Unnamed GPO" if a GPO clearly exists but isn't named. "" if nothing found.
+> - `gpoType` — "GPO" | "Distributor/Wholesaler" | "Compounder" | "Manufacturer direct" | "Unspecified" | "". Besse/McKesson/Cardinal/Henry Schein/CuraScript/ASD/Benco are "Distributor/Wholesaler" unless the text explicitly frames a GPO or group-purchasing agreement.
+> - `gpoSpend` — spend through that channel, short and unit-preserving. "" if not stated.
+> - `gpoEvidence` — short verbatim quote (max ~200 chars) with date. "" if none.
+>
+> **HONESTY:** Only what the sources say. Never infer a GPO from specialty. Empty is the correct answer for most deals. If a keyword appears but the surrounding text is truncated or unverifiable, leave it empty.
+>
+> **OUTPUT:** Write the file with `mcp__workspace__bash` (python3 json.dump) — the Write/Edit file tools cannot reach `/sessions/...` paths. JSON array to `{{OUT}}`, one object per input, same order, keys: practice, oppId, gpo, gpoType, gpoSpend, gpoEvidence. Validate with `python3 -c "import json;d=json.load(open('{{OUT}}'));print(len(d), sum(1 for x in d if x['gpo']))"`.
+>
+> Return ONLY a summary under 180 words: how many have a named channel, how many have a spend figure, frequency of each distinct name, and the 3 largest deals with channel lock-in plus their spend. Do NOT paste the JSON.
+
+---
+
+## Reference: Reason tags, product-vs-access split, and re-engagement score
+
+### The 14 reason tags
+
+Each closed-lost deal carries 0-3 tags. A tag is applied only when the sources show that thing actually blocked the deal — not when it was merely mentioned or listed as a feature of interest. (The first pass over-counted `multi-ein` six-fold by treating a "Features Valued" entry as a cause of death.)
+
+| Tag | Label in deliverables | Applies when… | Class |
+|---|---|---|---|
+| `no-engagement` | Never got a substantive conversation | No stakeholder ever heard a real pitch: voicemails, deferrals, silence | access |
+| `dm-access` | Decision-maker never reached | A champion engaged, then relayed the pitch second-hand to doctors/procurement who were never on a call | access |
+| `champion-turnover` | Champion left or was reassigned | The internal advocate resigned, was promoted, or left mid-cycle | access |
+| `switching-cost` | Switching / change-management cost | Doctors or admins declined to disturb working card/AP workflows (Amex points, per-doctor cards, mid-flight migrations) | mixed |
+| `cashback-rate` | Incumbent rate beats or matches 2.2% | A named competitor rate was at or above Nitra's, or rebate breadth lost | product |
+| `gpo-lockin` | GPO lock-in on drug spend | A GPO/distributor agreement governs purchasing and the card has nothing to run on | product |
+| `accounting-integration` | AP / accounting integration depth | Lost on 3-way PO matching, 1099s, Sage/NetSuite support, reconciliation | product |
+| `vendor-acceptance` | Key vendor won't take the card | Dominant supplier is ACH-only, or NitraMart doesn't carry the drug | product |
+| `float-terms` | Float, APR and payment terms | Wanted longer payoff windows, higher limits, or APR matching | product |
+| `multi-ein` | Multi-EIN / decentralized purchasing | Multi-entity structure that couldn't be accommodated — and this is what stalled it | product |
+| `emr-conflict` | EMR migration or EMR-bundled card | EMR go-live froze the decision, or the EMR vendor offered its own card | product |
+| `tax-treatment` | Cashback tax treatment | CPA or doctors objected to cashback as taxable income vs Amex points | product |
+| `trust` | Trust — unproven vendor | Unproven-vendor risk, or a bad prior experience with Nitra | mixed |
+| `not-icp` | Structurally not ICP | Bankruptcy, hospital-owned, lost the providers whose spend the case rested on | neither |
+
+**Product blocker** = any of the product-class tags. **Access only** = any access-class tag and no product-class tag. `switching-cost` and `trust` are counted in neither bucket by default; the deliverable states that. This split is the single most important number in the executive summary because it separates what a roadmap can fix from what a process change can fix.
+
+### Stall stage
+
+Furthest point the deal demonstrably reached, from activity evidence:
+
+`no contact` → `gatekeeper only` → `champion engaged` → `champion demo` → `DM demo` → `verbal/late stage`
+
+"Champion demo" and "DM demo" must be evidenced by a real meeting record, not a 1-minute unanswered call that someone logged as a demo (this happened in the source sheet).
+
+### Evidence strength
+
+- `strong` — direct quotes about the blocker, dated
+- `moderate` — some signal, partly inferred
+- `weak` — little or no source material; the hypothesis says only what is knowable
+
+### Re-engagement score (derived, 1-5)
+
+Assigned by `scripts/merge_batches.py` when no Salesforce field is supplied. The rule is intentionally simple so it can be explained on one line of the Read Me:
+
+```
+start at 2
++1 if stallStage in {champion demo, DM demo, verbal/late stage}
++1 if amount >= $1,000,000
++1 if any tag in {cashback-rate, dm-access, float-terms, switching-cost}   # addressable by a play we control
+-1 if evidenceStrength == weak
+-1 if any tag in {not-icp, trust}
+-1 if stallStage in {no contact, gatekeeper only}
+-2 if not a genuine loss / duplicate / asked not to be contacted
+clamp to 1..5
+```
+
+Why these levers: proximity to close and deal size set the prize; an addressable blocker means a rep can actually change the outcome; weak evidence means we don't know enough to prioritise it; not-ICP and trust rarely reverse; a deal nobody ever spoke to is a fresh prospect, not a re-engagement. Calibrated on the July-2026 population: 15 deals at 5, 72 at 4 (35% warm), which is a queue a team can actually work. The score orders the queue; it does not predict revenue — say that in the Read Me.
+
+If John supplies a Salesforce field name, read it, skip the rule, and note the source.
+
+### Customers mode: adoption state
+
+`fully ramped` · `partially adopted` · `onboarding` · `stalled/low usage` · `at risk` · `unknown`
+
+"At risk or stalled" = `at risk` ∪ `stalled/low usage`. Risk signals are free text; the workbook flags any non-empty value. Don't derive a numeric score for customers — the adoption state plus the named risk is more useful to a CSM than a number.
+
+---
+
+## Reference: QA'ing a large deck without LibreOffice timing out
+
+A one-slide-per-deal deck runs 100-300 slides. LibreOffice takes 60-120 s to convert that to PDF, which exceeds the 45 s shell timeout, and a half-finished conversion leaves a lock file that makes the next attempt hang forever.
+
+### Build a QA subset instead
+
+`scripts/build_lost_deck.js` accepts `--qa` which emits only: title, executive summary pages, key actions, first reasons page, first overview page, and six deal slides chosen to stress the layout (rank 1, the longest practice name, the longest death moment, one weak-evidence deal, one with a contradiction note, the last deal). That deck is ~15 slides and converts in seconds.
+
+```bash
+node scripts/build_lost_deck.js final.json qa_subset.pptx --qa
+cp qa_subset.pptx /tmp/qa/ && cd /tmp/qa
+python <pptx-skill>/scripts/office/soffice.py --headless --convert-to pdf qa_subset.pptx
+pdftoppm -jpeg -r 110 qa_subset.pdf s
+```
+
+Copy the JPEGs back under `outputs/` before viewing them — the `Read` tool can't see `/tmp`.
+
+### What to look for
+
+- Practice names over ~45 characters wrapping out of the header band (the builder scales the font; confirm it worked)
+- Death-moment text spilling past its card — the card height is computed from text length; a source string with unusual line breaks can defeat it
+- The facts card's last row touching the card border
+- Footer colliding with a chart or table on the summary pages
+- Rank badges on the reasons pages continuing across pages (1-3, 4-6, …)
+
+### If you must convert the full deck
+
+Detach it so the shell timeout doesn't kill it, and poll:
+
+```bash
+setsid nohup python <pptx-skill>/scripts/office/soffice.py --headless --convert-to pdf full.pptx > /tmp/conv.log 2>&1 < /dev/null & disown
+sleep 40; ls -la full.pdf || echo pending
+```
+
+If it never appears, `pkill -9 -f soffice`, remove any `.~lock.*#` files in the working directory, and try again from a fresh directory.
+
+### Validation is separate from rendering
+
+`validate.py` runs in seconds on any size deck and catches the XML faults PowerPoint rejects. Run it every time; rendering is for layout, validation is for file integrity.
+
+---
+
+## Scripts
+
+The skill package ships five executable scripts (not reproduced in full here — they're code, not documentation, but this is what each does and how they chain together):
+
+| Script | Language | Role |
+|---|---|---|
+| `scripts/make_batches.py` | Python | Splits `population.json` (or `final.json` for the GPO pass) into `batches/batch_NN.json` files sized for one subagent each (25 for lost/customers, ~80 for GPO). |
+| `scripts/merge_batches.py` | Python | Joins all `batches/out_NN.json` files back to the population, asserts zero mismatches, computes reason-tag statistics and the re-engagement score, and flags record-hygiene problems. Also handles the GPO merge pass (joins on oppId). |
+| `scripts/build_lost_workbook.py` | Python | Builds the formula-driven closed-lost Excel workbook from `final.json` and `narrative.json`. |
+| `scripts/build_customer_workbook.py` | Python | Builds the formula-driven current-customers Excel workbook from `final.json` and `narrative.json`. |
+| `scripts/build_lost_deck.js` | Node.js (`pptxgenjs`) | Builds the optional closed-lost PowerPoint deck; supports a `--qa` flag that emits a small representative subset for fast rendering checks. |
+
+*Original package: `closed-lost-analysis-skill.skill` (SKILL.md + 6 reference files + 5 scripts).*
