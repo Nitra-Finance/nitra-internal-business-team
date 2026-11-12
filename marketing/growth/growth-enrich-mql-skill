@@ -1,1 +1,203 @@
+---
+name: "enrich-mql-lead"
+description: "Enrich inbound MQL leads end-to-end: sweep John's Gmail for Jairus paid-social lead emails, filter spam, research the lead, dedupe and create Salesforce Account/Contact records, stamp the Salesforce MQL fields, fill out the MQL tracking sheet, refresh activity columns, label the email MQL-Enriched, and post an executive summary to #notifications-growth-leads with owner tag and ad-content summary in the thread. Use when adding, enriching, or sweeping for new leads, or when the hourly MQL task runs."
+---
 
+# Enrich an MQL lead
+
+"Enrich" means these steps, not just research:
+
+0. Find new Jairus lead emails in Gmail and filter out spam
+1. Research the lead
+2. Create the Salesforce Account and Contact **if they don't already exist** — no duplicates — and stamp the MQL fields on the Contact
+3. Fill out the row in the MQL Google Sheet
+4. Refresh the Activity Count and Last Activity Date columns from Salesforce
+5. Label the Gmail thread `MQL-Enriched`
+6. Post the executive summary to Slack #notifications-growth-leads, with the owner tag and ad-content summary in the thread
+
+A lead is not enriched until all of these are done.
+
+## Key references
+
+| Thing | Value |
+|---|---|
+| Lead emails | From `software@jairusmarketing.com` ("Jairus and Nitra Leads"), subject `You have a new Nitra <Specialty> <Campaign> Lead` |
+| Gmail label | `MQL-Enriched` (labelId `Label_1`) |
+| Inbox sweep query | `from:software@jairusmarketing.com subject:"new Nitra" -label:MQL-Enriched newer_than:14d` |
+| MQL sheet (enrichment target) | https://docs.google.com/spreadsheets/d/15S_StdHEyjyndM-WfTqgjSDJ9PPVaLXaRUph5C0hwEo/edit?gid=899334963 |
+| Jairus tracking sheet (ad proof source, read-only) | spreadsheet `1vzW5CLnmAKWPb7kkKrmNy6nMIl7b2bcBz8Lv4CPouhM`, tab `Paid Social` (gid 1001968895) |
+| Slack channel | #notifications-growth-leads, ID `C0C25G0C56H` |
+| Salesforce MQL fields (Contact) | `Latest_MQL_Date_Time__c`, `Latest_MQL_Source_Campaign__c` = `Paid Social Campaign 2026 (Jairus)` |
+
+## 0. Inbox sweep and spam filter
+
+Run the sweep query. Read each thread with `get_thread` to get the full form fields (Name, Email, Phone, Job Title, Company, "Which best describes you", specialty/campaign from the subject) and the email's received timestamp.
+
+Treat as spam / not a lead — label `MQL-Enriched` so it isn't picked up again, do **not** post to Slack, do **not** stamp MQL fields, and list it in the run report:
+- Test submissions: emails at nitra.com or jairusmarketing.com, names like "test", keyboard-mash emails (e.g. `fdsf@gmail.com`), obviously fake phone numbers
+- Gibberish or blank name/company
+- Clear non-ICP that research confirms (veterinary, retired with no practice, students, vendors/recruiters)
+
+**Resubmissions:** before enriching, search #notifications-growth-leads for the lead's email (`slack_search_public` with `in:<#C0C25G0C56H>`) and the MQL sheet. If the person was already posted, do not repost a new parent message. Re-stamp the MQL fields (step 2) with the new submission time, reply in the original Slack thread: "Resubmitted the form on <date> via <campaign>." plus the ad-content line from step 6, tag the owner per the step 6 rules, label the email, and move on.
+
+## 1. Research
+
+For each lead find: current practice/employer, website domain, clinician count (with credential breakdown, e.g. "3 (2 MD, 1 PA)"), full street address, practice phone, LinkedIn.
+
+- Use WebSearch/WebFetch, the practice's own site, and the NPI registry (npino.com, npiprofile.com). LinkedIn profile pages are behind an auth wall and can't be fetched — find the URL through search results and work around them.
+- **Do not trust ZoomInfo contact enrichment blindly.** It has returned an entirely different person at 50% accuracy. Verify any ZoomInfo match against a second source before using it.
+- Mark each finding HIGH (practice's own site or NPI), MEDIUM (directory), LOW (unverified). Write "not found" rather than guessing.
+- Actively look for disqualifiers and report them — they're valuable. Common ones: veterinary practices (CVT, FFCP, DVM credentials; "Animal" or "Pet" in the name), academic/health-system employment with no independent P&L, private-equity or MSO ownership, and people whose email domain belongs to a non-medical business.
+- Watch for a practice that has been absorbed by a PE platform. A lead can tick "I own the practice" in good faith and still sit inside a consolidator — check for a merger or acquisition before accepting the ownership claim, and record it in `Ownership_Source__c`.
+- A misleading email domain can hide a good lead as easily as a bad one. Check what the company actually is before disqualifying.
+- For many leads, run parallel subagents (3 leads each) and have them return compact structured blocks with confidence tags and source URLs.
+
+## 2. Salesforce — dedupe first, then create
+
+Search before every create. Query by, in order: contact email, LinkedIn URL, account website domain, account name fragments. SOSL `find` spell-corrects ("Safai" → "safari"), so prefer targeted SOQL.
+
+Expect the account to already exist — in practice most do. Link to it rather than creating a second one. Watch for accounts that already exist several times over; pick the record whose address and phone match the practice's real main location, and flag the duplicates rather than adding to them.
+
+The CRM is also a research source in its own right. An existing contact already attached to a plausible account is independent corroboration when external sources conflict about where someone works.
+
+If Salesforce's own duplicate rule blocks a create, inspect the flagged records before overriding — it sometimes fires on fuzzy name matches that aren't the same entity. Surface the decision rather than overriding silently.
+
+**Updating long-text / notes fields on existing records (org rule):** never write the field from new content alone. First read the record's current value for that field, then write the existing content followed by a new dated entry (`YYYY-MM-DD — <note>`) beneath it. If the current value can't be read, stop and flag it rather than writing. Don't edit other reps' records beyond this and the MQL stamp below.
+
+### Stamp the MQL fields (every real lead)
+
+On the lead's **Contact** (new or existing), set:
+
+- `Latest_MQL_Date_Time__c` = the Jairus email's received time, ISO 8601 UTC (e.g. `2026-11-11T08:31:41.000+0000`)
+- `Latest_MQL_Source_Campaign__c` = `Paid Social Campaign 2026 (Jairus)` (the org-standard value; don't invent per-specialty variants)
+
+Don't write `Active_MQL__c` — it's a formula that turns true for 30 days after `Latest_MQL_Date_Time__c`. Don't write the Account's `Has_Active_MQL__c` or `Latest_MQL_Date_Time__c` — a flow maintains them from the contact. After the update, re-query the Contact and confirm `Active_MQL__c = true`; flag it if not.
+
+Only move `Latest_MQL_Date_Time__c` forward: if the contact already has a later value (from another campaign), leave both fields alone and note it in the flags.
+
+### Account field conventions
+
+Required: `Name`, `Account_Website__c`. Mirror a recent comparable account for the rest:
+
+- `Website`, `Phone`, `Specialty__c` (picklist, e.g. Dermatology), `Number_of_Physicians__c`
+- `Time_Zone__c`, `Type` = "Sales Prospect", `AE_Prospecting_Stage__c` = "Net New", `Label__c` = "NEW"
+- `Ownership_Source__c` (Privately Owned / Physician Group / Private Equity Backed / Larger Health System / MSO)
+- Billing address fields, `OwnerId`
+
+Leave `Lead_Grade__c`, `Tier__c`, `Conference_Attended__c` and the approval-process fields alone — those are judgment calls.
+
+When the submitted company name and the practice's real name differ, the org convention is `Real Name (AKA Legal Entity)` so the account is findable under either.
+
+### Contact field conventions
+
+Required: `LastName`. Also set `FirstName`, `AccountId`, `Email`, `Phone`, `Title`, `LinkedIn_Profile_URL__c`, `Practice_Website__c`, mailing address, `OwnerId`, plus the MQL stamp above.
+
+Put a submitted personal mobile in `Phone` and the practice's published line in `HQ_Phone__c` — they are usually different, and a self-submitted number is often a direct mobile worth keeping.
+
+Confirm ownership: contacts default to the running user, but the parent account often belongs to a different rep.
+
+## 3. The MQL sheet
+
+Columns: Account Owner | Account Name | AccountId | ContactId | First Name | Last Name | Phone Number | Email | LinkedIn | Website | Clinician Count | Address | Source | Activity Count | Last Activity Date
+
+Account Owner is the **account's** owner in Salesforce, not the contact's. Source is `Paid Social – <Specialty>`.
+
+### Writing to the sheet
+
+The Google Drive connector is read-only for cells. Writes go through the browser, and the Sheets canvas ignores synthetic keystrokes — typing and Ctrl+Z do not work. Two things that do:
+
+- **Select a range** by navigating to `...edit#gid=<gid>&range=A33`. The name box (`#t-name-box`) confirms the selection.
+- **Write** by dispatching a synthetic paste onto `#waffle-rich-text-editor` with TSV as `text/plain`. Use plain text only — adding `text/html` can overwrite row formatting.
+
+```js
+const dt = new DataTransfer();
+dt.setData("text/plain", rows.map(r => r.join("\t")).join("\n"));
+const ed = document.getElementById("waffle-rich-text-editor");
+ed.focus();
+ed.dispatchEvent(new ClipboardEvent("paste", {clipboardData: dt, bubbles: true, cancelable: true}));
+```
+
+Undo, when needed, is a synthetic mouse click on `#t-undo` — not a keystroke.
+
+**If the browser is unreachable** (e.g. unattended run), don't block the rest of the workflow. Finish Salesforce, label and Slack, and put the ready-to-paste TSV row in a `Flag:` line in the Slack thread so John can paste it.
+
+### Row positions are not stable
+
+This sheet is edited by other people during a session and re-sorts. Row numbers from a read minutes ago may be wrong, and a misplaced paste silently overwrites someone else's row.
+
+**Before every write, verify the target by content, not by row number.** Navigate to the anchor cell (e.g. `F33`) and read `#t-formula-bar-input` to confirm the expected last name is there. Check the first and last row of the block. After writing, re-read and confirm each row landed on its intended person.
+
+**Pastes can land partially.** A paste has come back reporting success while the first few cells stayed empty or held the previous row's value. Always verify the written cells individually after the paste, not just the returned selection range, and re-paste the cells that missed.
+
+Prefer narrow writes (just the columns that changed) over full-row rewrites, so a concurrent edit by someone else isn't clobbered.
+
+## 4. Refresh the activity columns
+
+Both columns are **account level**, not contact level:
+
+- **Activity Count** ← `Account.Total_Account_Activities__c`
+- **Last Activity Date** ← `Account.LastActivityDate` (write as `YYYY-MM-DD`)
+
+Refresh the whole column on every run that writes to the sheet, not just the rows you added — these go stale immediately and the point is to see which practices are actually being worked.
+
+Collect the distinct AccountIds from column C, query them in one SOQL call, then map back to rows. Two rows sharing an account will show identical numbers; that is expected.
+
+Rules for the gaps:
+
+- **No AccountId → leave both cells empty.** Blank means "no Salesforce record", which is not the same as zero activity.
+- **AccountId present but zero activity → write `0` and leave the date blank.**
+- **AccountId that resolves to nothing** (a dead or deleted ID) → leave blank and flag it. Do not guess a replacement.
+- **A Contact ID sitting in the AccountId column** (starts `003`, not `001`) → resolve it to the contact's account, fill the activity from there, and flag the bad ID rather than silently rewriting column C.
+
+## 5. Label the email
+
+After the lead is in Salesforce (including the MQL stamp) and the sheet (or the TSV fallback is ready), apply `MQL-Enriched` (`Label_1`) to the Gmail thread with `label_thread`. Label only after enrichment succeeds, so a failed run gets retried next sweep. Leave read/unread state alone.
+
+## 6. Slack notification
+
+Post to #notifications-growth-leads (`C0C25G0C56H`) with `slack_send_message`. One parent message per lead, in exactly this format:
+
+```
+New lead - Paid Social – <Specialty>
+
+• Practice: <practice name>
+• Clinicians: <count (breakdown)>
+• Contact: <Full name, credential, title>
+• Phone: (xxx) xxx-xxxx
+• Email: <mailto:address>
+• Address: <street, city, ST zip>
+• Website: <domain or "not found">
+• LinkedIn: <URL or "not found">
+```
+
+Specialty is Dental / Dermatology / Retina (or as given in the email subject). Use "not found" for anything research couldn't confirm; add a short parenthetical when a value is uncertain (e.g. "per Salesforce; breakdown not confirmed").
+
+Then reply **in the thread** (`thread_ts` = the parent's ts) with one message containing:
+
+1. **Owner tag.** Look up the account owner in Salesforce (`Account.Owner.Name`, `Owner.Email`), find their Slack ID with `slack_search_users` by email, and write `<@SLACKID> this one is yours in Salesforce.`
+   - **Not on the sales team → tag Jamie and Jesse for re-assignment.** If the owner is Raul Vila Olazabal, Jamie Downey, John Kim, Johnathan Kim, or anyone else outside Sales, write: `Owned by <name> in Salesforce, not a sales rep. <@U0B89K6ERT2> <@U0BAAM5R62E> can you re-assign?`
+   - Known Slack IDs: Jamie Downey `U0B89K6ERT2`, Jesse Sun `U0BAAM5R62E` (Sales), Raul Vila Olazabal `U094SE6DZU3`, John Kim `U0AT0GP4EBS`, Johnathan Kim `U03TA5DE95H`. There is also a Jesse Hung in Engineering — Jesse means Jesse Sun.
+   - If the owner's Slack profile title/department isn't Sales, treat them as non-sales.
+2. **Ad content.** One or two sentences on what content drove the lead:
+   - In the Jairus tracking sheet, tab `Paid Social`, find the lead's row by email (column D). Read column G (Campaign, e.g. `Dental LG/RT`, `Derm TL/RT`) and the matching proof column: M = Derm LG, N = Retina LG, O = Dental LG, P = Derm TL, Q = Retina TL. The cell names the creative (e.g. `Video 1`, `Image 3`).
+   - Each proof column header in row 1 links to a Google Doc proof (read the header's hyperlink via `get_spreadsheet` with `textFormatRuns`). Current links: Derm LG `16C5AtUFxpFqLZ9WwC2PuD5Iai5Bz-9GXRtL2t0Namk4`, Retina LG `1wSOH0u_RJw-oN0mK_DyBrupiDbcu5wJ0nJ_xjZ7KtlM`, Dental LG `1Xp_jNJSZKeG8MaiawezLuEoaJ0q6oESpXjW4jaMb2PQ`, Derm TL `183JyVjzciUa5JXFcon_J96O_CmssiiTZQIij3G_M3UI`, Retina TL `1CD2xOpgVyQ0P5N26f8mIYKUFxXitse3oqW9NFMyBdIo`. Prefer the live header link if it differs.
+   - Read the proof doc (it's large — extract the text runs only), find the matching creative section ("Static Creative N" for `Image N`, "Video N" for videos) and the ad copy (post text, headline, description), and summarize the hook and offer. Example: `Ad: Dental LG – Image 3 (static). Pitch: 5% cashback on supply, equipment and pharma spend with the Nitra Visa Business Card; "trusted by 2,500+ providers."`
+   - If the row isn't in the tracking sheet yet or the proof cell is blank, write `Ad: <campaign from email subject>; creative not yet logged in the Jairus tracking sheet.`
+3. **Flags** (only if any), each on its own `Flag:` line: ICP concerns, ownership/PE conflicts, duplicate SF records, form vs research conflicts, MQL stamp skipped or not active, bad sheet IDs, and the TSV fallback row if the sheet write failed.
+
+Keep the tone neutral and short; these posts go out under John's name.
+
+## Reporting back
+
+Lead with what changed: leads posted, leads skipped as spam (and why), resubmissions, contacts stamped as MQL. Then flag, specifically:
+
+- Leads that don't fit ICP and why
+- Existing duplicate clusters found in Salesforce
+- Account names that disagree between Salesforce and the sheet
+- Stale field values on existing accounts (don't edit other reps' records — report them)
+- Bad IDs in the sheet: dead AccountIds, or Contact IDs in the AccountId column
+- Accounts with 0 activity that aren't newly created — an old untouched account is a signal
+- Any conflict between what the lead submitted on the form and what research shows
+- Any step that failed (MQL stamp, sheet write, label, Slack) so it can be finished by hand
+
+If the sweep finds nothing new, end with "No new Jairus leads."
